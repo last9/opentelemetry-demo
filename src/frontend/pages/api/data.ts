@@ -6,20 +6,43 @@ import InstrumentationMiddleware from '../../utils/telemetry/InstrumentationMidd
 import AdGateway from '../../gateways/rpc/Ad.gateway';
 import { Ad, Empty } from '../../protos/demo';
 
-type TResponse = Ad[] | Empty;
+type TResponse = Ad[] | Empty | { error: string };
 
 const handler = async ({ method, query }: NextApiRequest, res: NextApiResponse<TResponse>) => {
-  switch (method) {
-    case 'GET': {
-      const { contextKeys = [] } = query;
-      const { ads: adList } = await AdGateway.listAds(Array.isArray(contextKeys) ? contextKeys : contextKeys.split(','));
+  try {
+    switch (method) {
+      case 'GET': {
+        // Validate query parameter
+        if (!query.contextKeys) {
+          return res.status(400).json({ error: 'contextKeys parameter is required' });
+        }
 
-      return res.status(200).json(adList);
-    }
+        // Parse and validate context keys
+        const contextKeys = Array.isArray(query.contextKeys) 
+          ? query.contextKeys 
+          : query.contextKeys.split(',').filter(key => key.trim().length > 0);
 
-    default: {
-      return res.status(405).send('');
+        if (contextKeys.length === 0) {
+          return res.status(400).json({ error: 'At least one valid context key is required' });
+        }
+
+        // Get ads with error handling
+        try {
+          const { ads: adList } = await AdGateway.listAds(contextKeys);
+          return res.status(200).json(adList || []);
+        } catch (error) {
+          console.error('[AdGateway] Failed to fetch ads:', error);
+          return res.status(500).json({ error: 'Failed to fetch ads' });
+        }
+      }
+
+      default: {
+        return res.status(405).json({ error: 'Method not allowed' });
+      }
     }
+  } catch (error) {
+    console.error('[data-api] Unexpected error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 };
 

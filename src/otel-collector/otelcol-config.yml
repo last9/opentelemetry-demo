@@ -18,10 +18,6 @@ receivers:
   nginx:
     endpoint: http://${env:IMAGE_PROVIDER_HOST}:${env:IMAGE_PROVIDER_PORT}/status
     collection_interval: 10s
-  docker_stats:
-    endpoint: unix:///var/run/docker.sock
-    # https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/44511
-    api_version: "1.44"
   postgresql:
     endpoint: ${POSTGRES_HOST}:${POSTGRES_PORT}
     username: root
@@ -49,9 +45,41 @@ receivers:
     endpoint: "valkey-cart:6379"
     username: "valkey"
     collection_interval: 10s
-  # Host metrics
+  
+  # Kubernetes cluster metrics receiver
+  k8s_cluster:
+    auth_type: serviceAccount
+    collection_interval: 10s
+    node_conditions_to_report: [Ready, MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable]
+    allocatable_types_to_report: [cpu, memory, storage, ephemeral-storage]
+    metadata_exporters: [otlphttp/prometheus]
+    
+  # Kubernetes events receiver - filtered for otel-demo namespace only
+  k8s_events:
+    auth_type: serviceAccount
+    namespaces: [otel-demo]
+    
+  # Kubelet stats receiver for container/pod metrics
+  kubeletstats:
+    auth_type: serviceAccount
+    collection_interval: 10s
+    endpoint: "https://${env:K8S_NODE_NAME}:10250"
+    insecure_skip_verify: true
+    metric_groups:
+      - node
+      - pod
+      - container
+      - volume
+    extra_metadata_labels:
+      - container.id
+      - k8s.volume.type
+    k8s_api_config:
+      auth_type: serviceAccount
+
+  # Host metrics (keeping for node-level metrics)
   hostmetrics:
     root_path: /hostfs
+    collection_interval: 10s
     scrapers:
       cpu:
         metrics:
@@ -109,7 +137,6 @@ receivers:
         metrics:
           system.paging.usage:
             enabled: true
-
       processes:
       process:
         mute_process_exe_error: true
@@ -119,6 +146,7 @@ receivers:
         metrics:
           system.uptime:
             enabled: true
+
 exporters:
   debug:
   otlp:
@@ -142,13 +170,51 @@ exporters:
         insecure: true
     sending_queue:
       batch:
+
 processors:
   memory_limiter:
     check_interval: 5s
     limit_percentage: 80
     spike_limit_percentage: 25
   resourcedetection:
-    detectors: [env, docker, system]
+    detectors: [env, system]
+  # Add k8sattributes processor to enrich telemetry with k8s metadata
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    filter:
+      namespace: otel-demo
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.cronjob.name
+        - k8s.job.name
+        - k8s.node.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.pod.start_time
+      labels:
+        - tag_name: app.label.component
+          key: app.kubernetes.io/component
+          from: pod
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.ip
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.uid
+      - sources:
+          - from: connection
+  # Filter processor to keep only otel-demo namespace metrics
+  filter/namespace:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'resource.attributes["k8s.namespace.name"] != "otel-demo"'
   transform:
     error_mode: ignore
     trace_statements:
@@ -165,15 +231,15 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [resourcedetection, memory_limiter, transform]
+      processors: [k8sattributes, resourcedetection, memory_limiter, transform]
       exporters: [otlp, debug, spanmetrics]
     metrics:
-      receivers: [docker_stats, httpcheck/frontend-proxy, hostmetrics, nginx, otlp, postgresql, redis, spanmetrics]
-      processors: [resourcedetection, memory_limiter]
+      receivers: [httpcheck/frontend-proxy, hostmetrics, k8s_cluster, kubeletstats, nginx, otlp, postgresql, redis, spanmetrics]
+      processors: [k8sattributes, filter/namespace, resourcedetection, memory_limiter]
       exporters: [otlphttp/prometheus, debug]
     logs:
-      receivers: [otlp]
-      processors: [resourcedetection, memory_limiter]
+      receivers: [otlp, k8s_events]
+      processors: [k8sattributes, resourcedetection, memory_limiter]
       exporters: [opensearch, debug]
   telemetry:
     metrics:
